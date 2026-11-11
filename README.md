@@ -121,8 +121,3 @@ Assets/
   - `Brush Size`: Radius of the spherical terraforming brush (visualized as a yellow wire sphere Gizmo in Scene view).
 
 ---
-
-## Credits & References
-- Inspired by the Marching Cubes guide by [PolyCoding](https://polycoding.net/marching-cubes/).
-- Original Marching Cubes paper: Lorensen, W. E., & Cline, H. E. (1987). *Marching cubes: A high resolution 3D surface construction algorithm*. ACM SIGGRAPH Computer Graphics.
-- Noise library: [FastNoiseLite](https://github.com/Auburn/FastNoiseLite) (HLSL Compute implementation).
