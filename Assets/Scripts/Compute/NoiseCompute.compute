@@ -3,6 +3,16 @@
 #include "Includes\FastNoiseLite.compute"
 #include "Includes\MetricsCompute.compute"
 
+#ifndef GRID_TO_LOCAL_POS_DEFINED
+#define GRID_TO_LOCAL_POS_DEFINED
+static const float seamOverlap = 0.0f;
+
+float3 gridToLocalPos(float3 gridCoord, int gridResolution)
+{
+    return (gridCoord / (float)max(gridResolution - 1, 1)) * _Scale;
+}
+#endif
+
 RWStructuredBuffer<float> _Weights;
 
 float _NoiseScale;
@@ -12,18 +22,214 @@ int _Octaves;
 float _GroundPercent;
 int _GroundLevel;
 
+float _Lacunarity;
+float _Persistence;
+int _UsePerlinNoise;
+int _UseSphericalPlanet;
+float3 _PlanetCenter;
+float _PlanetRadius;
+float _IsoLevel;
+
+int _EnableCaves;
+float _CaveDepth;
+float _CaveFrequency;
+float _CaveThreshold;
+float _CellSize;
+
+float smin(float a, float b, float k)
+{
+    float h = saturate(0.5f + 0.5f * (b - a) / max(k, 1e-4f));
+    return lerp(b, a, h) - k * h * (1.0f - h);
+}
+
 
 [numthreads(numThreads, numThreads, numThreads)]
 void GenerateNoise(uint3 id : SV_DispatchThreadID)
 {
-    fnl_state noise = fnlCreateState();
-    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
-    noise.fractal_type = FNL_FRACTAL_RIDGED;
-    noise.frequency = _Frequency;
-    noise.octaves = _Octaves;
+    if (id.x >= (uint)_ChunkSize || id.y >= (uint)_ChunkSize || id.z >= (uint)_ChunkSize)
+    {
+        return;
+    }
 
-    float3 pos = (id * _NoiseScale) / (_ChunkSize - 1) * _Scale;
-    float ground = -pos.y + (_GroundPercent * _GroundLevel);
-    float n = /*ground +*/ fnlGetNoise3D(noise, pos.x, pos.y, pos.z) * _Amplitude;
+    fnl_state noise = fnlCreateState();
+    noise.noise_type = (_UsePerlinNoise != 0) ? FNL_NOISE_PERLIN : FNL_NOISE_OPENSIMPLEX2;
+    noise.fractal_type = FNL_FRACTAL_NONE;
+    noise.frequency = _Frequency;
+
+    float3 worldPos = _ChunkOffset + gridToLocalPos(float3(id), _ChunkSize);
+    int seed = noise.seed;
+    int octaveCount = clamp(_Octaves, 2, 8);
+
+    float n;
+    if (_UseSphericalPlanet != 0)
+    {
+        float3 radialVec = worldPos - _PlanetCenter;
+        float distFromCenter = length(radialVec);
+        float3 radialDir = (distFromCenter > 1e-4f) ? (radialVec / distFromCenter) : float3(0.0f, 1.0f, 0.0f);
+        float3 sphereSurfacePos = _PlanetCenter + radialDir * _PlanetRadius;
+
+        float3 pCont = sphereSurfacePos * _NoiseScale;
+        _fnlTransformNoiseCoordinate3D(noise, pCont.x, pCont.y, pCont.z);
+
+        // 3D domain warping twists smooth coastlines into bays, peninsulas, and island chains
+        float3 warpVec = float3(
+            _fnlGenNoiseSingle3D(noise, seed + 31, pCont.x * 0.7f, pCont.y * 0.7f, pCont.z * 0.7f),
+            _fnlGenNoiseSingle3D(noise, seed + 67, pCont.x * 0.7f, pCont.y * 0.7f, pCont.z * 0.7f),
+            _fnlGenNoiseSingle3D(noise, seed + 97, pCont.x * 0.7f, pCont.y * 0.7f, pCont.z * 0.7f)
+        );
+        float3 pWarped = pCont + warpVec * 0.38f;
+
+        // Tectonic belt mask: winding mountain chains framing open rolling valleys
+        float tectonicRaw = _fnlGenNoiseSingle3D(noise, seed + 101, pWarped.x * 0.65f, pWarped.y * 0.65f, pWarped.z * 0.65f);
+        float tectonicBelt = smoothstep(0.32f, 0.82f, 1.0f - _fnlFastAbs(tectonicRaw));
+
+        // 1. Continental & Foothill FBM (4 octaves for fast & crisp coastlines)
+        float continental = 0.0f;
+        float contAmp = 1.0f;
+        float contMax = 0.0f;
+        float3 pc = pWarped;
+        for (int i = 0; i < 4; i++)
+        {
+            float raw = _fnlGenNoiseSingle3D(noise, seed + i, pc.x, pc.y, pc.z);
+            continental += raw * contAmp;
+            contMax += contAmp;
+            contAmp *= _Persistence;
+            pc *= _Lacunarity;
+        }
+
+        // Gentle land bias ensures broad plains & rolling valley vistas alongside bays/coasts
+        float contNorm = (continental / max(contMax, 1e-4f)) * 1.35f + 0.14f;
+        float inlandMask = smoothstep(0.02f, 0.32f, contNorm);
+        float mountainMask = inlandMask * smoothstep(0.18f, 0.82f, tectonicBelt);
+
+        // 2-octave rolling hills & valley dunes across continental plains (100% LOD-invariant)
+        float hills = 0.0f;
+        if (contNorm > -0.02f)
+        {
+            float3 ph1 = pWarped * 2.2f;
+            float3 ph2 = pWarped * 4.8f;
+            float h1 = _fnlGenNoiseSingle3D(noise, seed + 151, ph1.x, ph1.y, ph1.z);
+            float h2 = _fnlGenNoiseSingle3D(noise, seed + 173, ph2.x, ph2.y, ph2.z);
+            hills = (h1 * 0.085f + h2 * 0.040f) * smoothstep(0.01f, 0.20f, contNorm);
+        }
+
+        // 2. Stylized Mountain Peaks (100% LOD-invariant across all chunk depths)
+        float mntNorm = 0.0f;
+        if (mountainMask > 0.001f)
+        {
+            float3 pm = pWarped * 1.95f;
+            float mountain = 0.0f;
+            float mntAmp = 1.0f;
+            float mntMax = 0.0f;
+            float erosionWeight = 1.0f;
+            int mntOctaves = clamp(_Octaves, 3, 4);
+            for (int j = 0; j < mntOctaves; j++)
+            {
+                float rawM = _fnlGenNoiseSingle3D(noise, seed + 200 + j, pm.x, pm.y, pm.z);
+                float ridgeEps = 0.001f * (1.0f + (float)j * 1.5f);
+                float smoothAbs = sqrt(rawM * rawM + ridgeEps);
+                float ridge = saturate(1.0f - smoothAbs);
+                ridge *= ridge;
+                ridge *= erosionWeight;
+                erosionWeight = saturate(ridge * 1.6f);
+
+                mountain += ridge * mntAmp;
+                mntMax += mntAmp;
+                mntAmp *= (_Persistence * 0.95f);
+                pm *= _Lacunarity;
+            }
+            mntNorm = (mountain / max(mntMax, 1e-4f)) * 1.25f;
+        }
+
+        float rawElevation;
+        if (contNorm >= 0.0f)
+        {
+            float landSlope = pow(max(contNorm, 1e-5f), 1.15f) * 0.25f;
+            float plainsAndHills = max(0.0f, landSlope + hills);
+            float mountainRange = mountainMask * mntNorm * 0.62f;
+            rawElevation = (plainsAndHills + mountainRange) * _Amplitude;
+        }
+        else
+        {
+            rawElevation = max(contNorm * 10.0f, -1.6f);
+        }
+
+        // 3. 3D Volumetric Overhangs & Cliff Ledges (restrained for crisp stylized peaks)
+        float distToSurface = abs(distFromCenter - (_PlanetRadius + rawElevation));
+        float surfaceBand = saturate(1.0f - distToSurface / max(_Amplitude * 0.45f, 1.0f));
+        float cliffMask = mountainMask * surfaceBand * smoothstep(0.24f, 0.78f, mntNorm);
+        float overhangOffset = 0.0f;
+        if (cliffMask > 0.001f)
+        {
+            float3 pVol = worldPos * (_NoiseScale * 6.0f);
+            _fnlTransformNoiseCoordinate3D(noise, pVol.x, pVol.y, pVol.z);
+            pVol += warpVec * 0.55f;
+            float vol1 = _fnlGenNoiseSingle3D(noise, seed + 307, pVol.x, pVol.y, pVol.z);
+            float vol2 = _fnlGenNoiseSingle3D(noise, seed + 313, pVol.x * 2.05f, pVol.y * 2.05f, pVol.z * 2.05f) * 0.5f;
+            overhangOffset = cliffMask * (vol1 + vol2) * (_Amplitude * 0.14f);
+        }
+
+        float rockSdf = (_PlanetRadius + rawElevation + overhangOffset) - distFromCenter;
+
+        // 4. Optional Deep Buried Subsurface Caverns (100% LOD-invariant, strictly >= 50m underground)
+        if (_EnableCaves != 0)
+        {
+            float depthBelowTerrain = (_PlanetRadius + rawElevation) - distFromCenter;
+            if (contNorm > 0.05f && depthBelowTerrain > 48.0f && distFromCenter > (_PlanetRadius - _CaveDepth - 4.0f))
+            {
+                fnl_state caveNoise = noise;
+                caveNoise.frequency = _CaveFrequency;
+
+                float3 pCave = worldPos * _NoiseScale;
+                _fnlTransformNoiseCoordinate3D(caveNoise, pCave.x, pCave.y, pCave.z);
+
+                float c1 = _fnlGenNoiseSingle3D(caveNoise, seed + 401, pCave.x, pCave.y, pCave.z);
+                float c2 = _fnlGenNoiseSingle3D(caveNoise, seed + 503, pCave.x, pCave.y, pCave.z);
+                float tubeDist = sqrt(c1 * c1 + c2 * c2);
+
+                float c3 = _fnlGenNoiseSingle3D(caveNoise, seed + 607, pCave.x * 0.52f, pCave.y * 0.52f, pCave.z * 0.52f);
+
+                float landMask = smoothstep(0.05f, 0.20f, contNorm);
+                float bottomFade = smoothstep(_PlanetRadius - _CaveDepth, _PlanetRadius - _CaveDepth + 28.0f, distFromCenter);
+                float topFade = smoothstep(50.0f, 110.0f, depthBelowTerrain);
+                float caveMask = landMask * bottomFade * topFade;
+
+                float tunnelSdf = (tubeDist - _CaveThreshold) * 65.0f;
+                float chamberDepthMask = smoothstep(65.0f, 100.0f, depthBelowTerrain);
+                float chamberSdf = (0.56f - c3) * 55.0f;
+                float caveSdf = lerp(tunnelSdf, min(tunnelSdf, chamberSdf), chamberDepthMask);
+
+                rockSdf = lerp(rockSdf, smin(rockSdf, caveSdf, 4.5f), caveMask);
+            }
+        }
+
+        n = _IsoLevel + rockSdf;
+    }
+    else
+    {
+        float3 p = worldPos * _NoiseScale;
+        _fnlTransformNoiseCoordinate3D(noise, p.x, p.y, p.z);
+
+        float sum = 0.0f;
+        float amp = 1.0f;
+        float maxAmp = 0.0f;
+
+        for (int i = 0; i < octaveCount; i++)
+        {
+            float raw = _fnlFastAbs(_fnlGenNoiseSingle3D(noise, seed++, p.x, p.y, p.z));
+            float ridge = 1.0f - 2.0f * raw;
+            sum += ridge * amp;
+            maxAmp += amp;
+
+            amp *= lerp(1.0f, 1.0f - raw, 0.5f);
+            p *= _Lacunarity;
+            amp *= _Persistence;
+        }
+
+        float fractalNoise = (maxAmp > 0.0f) ? (sum / maxAmp) : 0.0f;
+        float ground = -worldPos.y + (_GroundPercent * _GroundLevel);
+        n = ground + fractalNoise * _Amplitude;
+    }
+
     _Weights[indexFromCoord(id.x, id.y, id.z)] = n;
 }

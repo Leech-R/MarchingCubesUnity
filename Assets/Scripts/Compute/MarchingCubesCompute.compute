@@ -1,9 +1,20 @@
 ﻿#pragma kernel March
 #pragma kernel UpdateWeights
+#pragma kernel UpdateWeightsBatch
 
 #include "Includes\MarchingTable.hlsl"
 
 #include "Includes\MetricsCompute.compute"
+
+#ifndef GRID_TO_LOCAL_POS_DEFINED
+#define GRID_TO_LOCAL_POS_DEFINED
+static const float seamOverlap = 0.0f;
+
+float3 gridToLocalPos(float3 gridCoord, int gridResolution)
+{
+    return (gridCoord / (float)max(gridResolution - 1, 1)) * _Scale;
+}
+#endif
 
 
 RWStructuredBuffer<float> _Weights;
@@ -12,9 +23,17 @@ float3 _HitPosition;
 float _BrushSize;
 float _TerraformStrength;
 
-float _IsoLevel;
+struct TerraformStrokeGPU
+{
+    float3 hitPosition;
+    float brushSize;
+    float strength;
+};
 
-float _LodScaleFactor;
+StructuredBuffer<TerraformStrokeGPU> _StrokeBuffer;
+int _StrokeCount;
+
+float _IsoLevel;
 
 int _LODSize;
 
@@ -23,33 +42,43 @@ struct Triangle {
 };
 
 AppendStructuredBuffer<Triangle> _Triangles;
+RWByteAddressBuffer _ChunkMeta;
 
 float3 interp(float3 edgeVertex1, float valueAtVertex1, float3 edgeVertex2, float valueAtVertex2)
 {
-    return (edgeVertex1 + (_IsoLevel - valueAtVertex1) * (edgeVertex2 - edgeVertex1) / (valueAtVertex2 - valueAtVertex1));
+    float denom = valueAtVertex2 - valueAtVertex1;
+    float t = (abs(denom) > 1e-5f) ? ((_IsoLevel - valueAtVertex1) / denom) : 0.5f;
+    return edgeVertex1 + t * (edgeVertex2 - edgeVertex1);
 }
 
 
 [numthreads(numThreads, numThreads, numThreads)]
 void March(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= _LODSize - 1 || id.y >= _LODSize - 1 || id.z >= _LODSize - 1)
+    if (id.x == 0 && id.y == 0 && id.z == 0)
+    {
+        // 1 = Air (< _IsoLevel), 2 = Solid (>= _IsoLevel); by IVT, when triCount == 0 the entire chunk shares this state
+        uint signState = (_Weights[0] < _IsoLevel) ? 1u : 2u;
+        _ChunkMeta.Store(4, signState);
+    }
+
+    if (id.x >= (uint)(_LODSize - 1) || id.y >= (uint)(_LODSize - 1) || id.z >= (uint)(_LODSize - 1))
     {
         return;
     }
 
-    float3 samplePos = id * _LodScaleFactor;
-    float unit = 1 * _LodScaleFactor;
+    int3 c0 = int3(id);
+    int3 c1 = int3(id) + 1;
 
     float cubeValues[8] = {
-       _Weights[indexFromCoord(samplePos.x, samplePos.y, samplePos.z + unit)],
-       _Weights[indexFromCoord(samplePos.x + unit, samplePos.y, samplePos.z + unit)],
-       _Weights[indexFromCoord(samplePos.x + unit, samplePos.y, samplePos.z)],
-       _Weights[indexFromCoord(samplePos.x, samplePos.y, samplePos.z)],
-       _Weights[indexFromCoord(samplePos.x, samplePos.y + unit, samplePos.z + unit)],
-       _Weights[indexFromCoord(samplePos.x + unit, samplePos.y + unit, samplePos.z + unit)],
-       _Weights[indexFromCoord(samplePos.x + unit, samplePos.y + unit, samplePos.z)],
-       _Weights[indexFromCoord(samplePos.x, samplePos.y + unit, samplePos.z)]
+       _Weights[indexFromCoord(c0.x, c0.y, c1.z)],
+       _Weights[indexFromCoord(c1.x, c0.y, c1.z)],
+       _Weights[indexFromCoord(c1.x, c0.y, c0.z)],
+       _Weights[indexFromCoord(c0.x, c0.y, c0.z)],
+       _Weights[indexFromCoord(c0.x, c1.y, c1.z)],
+       _Weights[indexFromCoord(c1.x, c1.y, c1.z)],
+       _Weights[indexFromCoord(c1.x, c1.y, c0.z)],
+       _Weights[indexFromCoord(c0.x, c1.y, c0.z)]
     };
 
     int cubeIndex = 0;
@@ -78,9 +107,9 @@ void March(uint3 id : SV_DispatchThreadID)
         int e20 = edgeConnections[edges[i + 2]][0];
         int e21 = edgeConnections[edges[i + 2]][1];
         Triangle tri;
-        tri.a = (interp(cornerOffsets[e00], cubeValues[e00], cornerOffsets[e01], cubeValues[e01]) + id) / (_LODSize - 1) * _Scale;
-        tri.b = (interp(cornerOffsets[e10], cubeValues[e10], cornerOffsets[e11], cubeValues[e11]) + id) / (_LODSize - 1) * _Scale;
-        tri.c = (interp(cornerOffsets[e20], cubeValues[e20], cornerOffsets[e21], cubeValues[e21]) + id) / (_LODSize - 1) * _Scale;
+        tri.a = gridToLocalPos(interp(cornerOffsets[e00], cubeValues[e00], cornerOffsets[e01], cubeValues[e01]) + id, _LODSize);
+        tri.b = gridToLocalPos(interp(cornerOffsets[e10], cubeValues[e10], cornerOffsets[e11], cubeValues[e11]) + id, _LODSize);
+        tri.c = gridToLocalPos(interp(cornerOffsets[e20], cubeValues[e20], cornerOffsets[e21], cubeValues[e21]) + id, _LODSize);
         _Triangles.Append(tri);
     }
 
@@ -90,13 +119,44 @@ void March(uint3 id : SV_DispatchThreadID)
 [numthreads(numThreads, numThreads, numThreads)]
 void UpdateWeights(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= _ChunkSize - 1 || id.y >= _ChunkSize - 1 || id.z >= _ChunkSize - 1)
+    if (id.x >= (uint)_ChunkSize || id.y >= (uint)_ChunkSize || id.z >= (uint)_ChunkSize)
     {
         return;
     }
 
-    if (distance((float3(id) / (_ChunkSize - 1) * _Scale), _HitPosition) <= _BrushSize)
+    float3 worldPos = _ChunkOffset + gridToLocalPos(float3(id), _ChunkSize);
+    float dist = distance(worldPos, _HitPosition);
+    if (dist <= _BrushSize)
     {
-        _Weights[indexFromCoord(id.x, id.y, id.z)] += _TerraformStrength;
+        float falloff = 1.0f - (dist / max(_BrushSize, 1e-4f));
+        _Weights[indexFromCoord(id.x, id.y, id.z)] += _TerraformStrength * falloff;
+    }
+}
+
+[numthreads(numThreads, numThreads, numThreads)]
+void UpdateWeightsBatch(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_ChunkSize || id.y >= (uint)_ChunkSize || id.z >= (uint)_ChunkSize)
+    {
+        return;
+    }
+
+    float3 worldPos = _ChunkOffset + gridToLocalPos(float3(id), _ChunkSize);
+    float totalDelta = 0.0f;
+
+    for (int i = 0; i < _StrokeCount; i++)
+    {
+        TerraformStrokeGPU s = _StrokeBuffer[i];
+        float dist = distance(worldPos, s.hitPosition);
+        if (dist <= s.brushSize)
+        {
+            float falloff = 1.0f - (dist / max(s.brushSize, 1e-4f));
+            totalDelta += s.strength * falloff;
+        }
+    }
+
+    if (totalDelta != 0.0f)
+    {
+        _Weights[indexFromCoord(id.x, id.y, id.z)] += totalDelta;
     }
 }

@@ -1,9 +1,20 @@
 ﻿static const uint numThreads = 8;
 
 int _ChunkSize;
-int _Scale;
+float _Scale;
+float3 _ChunkOffset;
 
 int indexFromCoord(int x, int y, int z)
 {
     return x + _ChunkSize * (y + _ChunkSize * z);
 }
+
+#ifndef GRID_TO_LOCAL_POS_DEFINED
+#define GRID_TO_LOCAL_POS_DEFINED
+static const float seamOverlap = 0.0f;
+
+float3 gridToLocalPos(float3 gridCoord, int gridResolution)
+{
+    return (gridCoord / (float)max(gridResolution - 1, 1)) * _Scale;
+}
+#endif

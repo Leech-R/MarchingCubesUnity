@@ -1,79 +1,81 @@
-# GPU-Accelerated 3D Procedural Terrain & Caves (Marching Cubes in Unity)
+# 60 km GPU Procedural Planet & Voxel Terraforming Engine (Unity 6 / URP)
 
-A real-time procedural voxel terrain and cave generation system built in **Unity (URP)** using **C#** and **HLSL Compute Shaders**. This project implements the **Marching Cubes algorithm** entirely on the GPU to polygonize 3D scalar density fields generated with **FastNoiseLite (3D Ridged OpenSimplex2 fractal noise)**, complete with **dynamic Level of Detail (LOD)** and **real-time interactive terraforming**.
-
----
-
-## Key Features
-
-- **GPU-Accelerated Marching Cubes (`HLSL` Compute Shaders):** Evaluates 3D voxel grids in parallel using `8x8x8` thread groups (`[numthreads(8, 8, 8)]`), outputting triangles directly into a GPU `AppendStructuredBuffer` without CPU bottlenecks.
-- **3D Procedural Cave & Terrain Noise:** Generates volumetric scalar fields on the GPU using **FastNoiseLite** (`OpenSimplex2` with `Ridged` multi-fractal octaves) to create complex 3D overhangs, tunnels, and cave networks that standard 2D heightmaps cannot represent.
-- **Real-Time Raycast Terraforming:** Supports interactive sculpting (adding and excavating terrain) at runtime via camera raycasting and a dedicated `UpdateWeights` compute kernel.
-- **Dynamic Level of Detail (LOD):** Decouples the underlying high-resolution density field (`80³` points per chunk) from the polygonization resolution, supporting 10 selectable LOD tiers (`8³` up to `80³`) on the fly.
+A real-time procedural spherical planet and volumetric terrain engine built in **Unity 6 (`6000.0.22f1`, Universal Render Pipeline)** using **C#**, **HLSL Compute Shaders**, and custom **URP Shaders**. The project streams a **60 km diameter planet** (`R = 30,000 m`) in real time by combining **GPU Marching Cubes**, **Astroneer-style 3-stage octree chunk streaming**, **non-blocking `AsyncGPUReadback`**, **zero-PhysX mesh raycasting**, and **stylized low-poly biome & atmosphere shaders**.
 
 ---
 
-## How It Works (Architecture & Pipeline)
+## Core Features
 
-The system is divided into a **3-stage GPU-to-CPU pipeline** orchestrated by C# components and executed on the GPU via HLSL Compute Shaders:
+- **60 km Spherical Procedural Terrain (`NoiseCompute.compute`, `NoiseGenerator.cs`):**
+  - Evaluates a continuous 3D scalar density field over a 30 km-radius sphere (`RootSize = 65,536 m`), combining domain-warped 3D **OpenSimplex2** (or **Perlin**) continents, 2-octave LOD-invariant rolling hills, tectonic ridged mountain chains (`amplitude = 520 m`, `frequency = 0.00028`), continuous shorelines transitioning to a flat spherical sea surface (`-1.6 m` depth cap), restrained 3D cliff overhangs, and optional deep buried subsurface caverns.
+- **Astroneer-Style 3-Stage Partial Loading & Progressive Octree LOD (`PlanetOctree.cs`):**
+  - Dynamically streams only the visible patch of the planet (`SurfaceRenderDistance = 10 km`, `MaxDepth = 8`, `16³` voxel cells per leaf chunk) using:
+    1. **Stage 1 — Spherical Shell Culling:** Skips octants strictly inside solid core or empty space (`_cachedRMin` to `_cachedRMax`) via closest/farthest AABB-to-center distance checks.
+    2. **Stage 2 — Planetary Horizon Culling:** Culls chunks occluded behind the planet's curvature (`_cachedCamHorizonAngle`).
+    3. **Stage 3 — 6-Plane Camera Frustum Culling & Unloading:** Unloads out-of-view chunks beyond a 360° safety bubble (`ImmediateBubbleRadius = 320 m`, `FrustumUnloadDistance = 900 m`).
+  - Uses velocity look-ahead, 3-tier depth-aware split distances, `ProgressiveGateDepth = 6` to prevent speculative subdivision of empty blocks near the ground, and a `Stack<Chunk>` object pool.
+- **2-Stage Non-Blocking Async GPU Readback & IVT Empty Pruning (`Chunk.cs`, `MarchingCubesCompute.compute`):**
+  - Dispatches compute generation and triangle extraction across a **16-slot `AsyncGPUReadback` pipeline**.
+  - **Stage 1** reads back only triangle counts plus Intermediate Value Theorem (IVT) sign flags (`AllAir` vs `AllSolid`) so completely empty chunks are pruned immediately without transferring triangle buffers; **Stage 2** uploads surface geometry within a per-frame CPU budget (`FrameBuildBudgetMs = 1.5 ms`).
+- **Stylized Flat-Faceted & Toggleable Smooth-Welded Modes + Watertight Skirts (`Chunk.cs`):**
+  - Defaults to crisp flat-shaded low-poly facets (zero vertex-welding or boundary-normal overhead) and can toggle live (`[F]`) to $O(1)$ quantized spatial-hash vertex welding with cross-chunk normal stitching.
+  - Generates downward LOD-seam skirts (`1.50 * cellSize`) in both shading modes so chunk boundaries and LOD transitions remain watertight.
+- **Zero-PhysX Interactive Terraforming & Batched GPU Stroke Replay (`TerraformingCamera.cs`, `PlanetOctree.cs`, `Chunk.cs`):**
+  - Uses a bounds-sorted CPU Möller–Trumbore raycast (`RaycastTerrain` / `RaycastMesh`) directly against pre-skirt surface triangles instead of baking PhysX `MeshCollider`s while flying or aiming.
+  - Coalesces strokes and indexes them with an $O(1)$ global bounding-box early-out, clamped bucket spans, and direct list fallback (`HasIntersectingStroke` / `CollectIntersectingStrokes`), caches recently sculpted chunks in an **8-slot LRU VRAM weight buffer pool** for $O(1)$ incremental sculpting (`UpdateWeights`), and replays strokes onto newly streamed chunks via batched GPU dispatches (`UpdateWeightsBatch`).
+- **Stylized URP Terrain, Water & Atmospheric Skybox (`ProceduralTerrain.shader`, `SpaceAtmosphereSkybox.shader`):**
+  - Shades terrain in 3 fast 3D procedural noise lookups: emerald/teal grasslands, cohesive terracotta valley soil patches, sandy beaches, glacial slate mountain rock, snow caps, turquoise-to-deep-blue spherical ocean normals with analytical waves, and subtle cyan aerial perspective.
+  - Renders an orbital-to-surface skybox transitioning smoothly from a procedural starfield and solar corona in space to a vivid cyan atmosphere with drifting procedural puffy clouds and a banded lavender distant moon.
 
+---
+
+## Architecture & Data Pipeline
+
+```text
++-------------------------------------------------------------------------+
+| 1. 3-Stage Octree Culling & Progressive LOD (CPU: PlanetOctree.cs)      |
+|    - Shell, Planetary Horizon & Frustum culling + velocity look-ahead   |
+|    - ProgressiveGateDepth confirms surface at Depth 6 before splitting  |
++-------------------------------------------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| 2. LOD-Invariant Planetary Density Field (GPU: NoiseCompute.compute)    |
+|    - Warped continents, 2-octave hills, tectonic ridged mountains       |
+|    - Flattened spherical ocean floor & optional deep subsurface caverns |
++-------------------------------------------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| 3. Marching Cubes & IVT Metadata (GPU: MarchingCubesCompute.compute)    |
+|    - Extracts surface triangles into AppendStructuredBuffer<Triangle>   |
+|    - Records AllAir / AllSolid IVT sign flag when triangle count == 0   |
++-------------------------------------------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| 4. 2-Stage Async Readback, Skirts & Raycast Prep (CPU: Chunk.cs)        |
+|    - Stage 1: count + IVT early-out; Stage 2: CPU-budgeted mesh build   |
+|    - Snapshots pre-skirt surface for raycasting & appends seam skirts   |
++-------------------------------------------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| 5. Stylized Rendering & Skybox (GPU: URP Shaders)                       |
+|    - ProceduralTerrain.shader: biomes, smooth water normals, cyan haze  |
+|    - SpaceAtmosphereSkybox.shader: stars, sky dome, clouds & banded moon|
++-------------------------------------------------------------------------+
 ```
-+-----------------------------------------------------------------------+
-| 1. 3D Noise Generation (GPU: NoiseCompute.compute)                    |
-|    - Evaluates 3D OpenSimplex2 Ridged Fractal Noise at each grid pt   |
-|    - Stores scalar density values in a 1D flattened _Weights array    |
-+-----------------------------------------------------------------------+
-                                   |
-                                   v
-+-----------------------------------------------------------------------+
-| 2. Isosurface Extraction (GPU: MarchingCubesCompute.compute)          |
-|    - Samples 8 corners of each voxel cell in parallel                 |
-|    - Computes an 8-bit cubeIndex (0..255) against _IsoLevel (0.5)     |
-|    - Looks up intersected edges in triTable[256][16]                  |
-|    - Linearly interpolates vertex positions along edges               |
-|    - Appends triangles to AppendStructuredBuffer<Triangle>            |
-+-----------------------------------------------------------------------+
-                                   |
-                                   v
-+-----------------------------------------------------------------------+
-| 3. Mesh Assembly & Physics (CPU: Chunk.cs)                            |
-|    - Reads back triangle count via ComputeBuffer.CopyCount            |
-|    - Constructs Unity Mesh, recalculates normals, updates Collider    |
-+-----------------------------------------------------------------------+
-```
 
-### 1. Volumetric Scalar Field (3D Density Grid)
-Unlike traditional terrain systems that map `(x, z) -> height` (which can only represent a single surface height per column), this project represents space as a 3D grid of scalar density values ("weights").
-- **3D-to-1D Indexing:** Located in `MetricsCompute.compute`, 3D coordinates $(x, y, z)$ within a chunk of size $N$ (`_ChunkSize`) are flattened into a contiguous 1D buffer index:
-  $$\text{Index}(x, y, z) = x + N \cdot (y + N \cdot z)$$
-- **Noise Evaluation:** `NoiseCompute.compute` runs on the GPU to populate the grid using 3D Ridged Fractal OpenSimplex2 noise (`FNL_NOISE_OPENSIMPLEX2`, `FNL_FRACTAL_RIDGED`), parameterized by frequency, amplitude, octaves, and scale.
+---
 
-### 2. The Marching Cubes Algorithm
-Implemented in `MarchingCubesCompute.compute` (`March` kernel):
-1. **Voxel Sampling:** Each GPU thread processes one voxel cube by reading the density weights at its **8 corner vertices** (`cubeValues[0..7]`).
-2. **Bitmask Classification (`cubeIndex`):** Each corner's weight is compared against the surface threshold (`_IsoLevel = 0.5`). If `cubeValues[i] < _IsoLevel`, the $i$-th bit of `cubeIndex` is set:
-   ```hlsl
-   int cubeIndex = 0;
-   if (cubeValues[0] < _IsoLevel) cubeIndex |= 1;   // 2^0
-   if (cubeValues[1] < _IsoLevel) cubeIndex |= 2;   // 2^1
-   // ... up to corner 7 (2^7 = 128)
-   ```
-   Since each of the 8 corners is either inside or outside the surface, there are $2^8 = 256$ possible configurations.
-3. **Lookup Table (`MarchingTable.hlsl`):** Using `cubeIndex`, the shader indexes into `triTable[256][16]`, which lists the cube edges (0–11) intersected by the surface, grouped into up to 5 triangles per voxel.
-4. **Linear Interpolation (`interp`):** Instead of placing vertices rigidly at edge midpoints (which produces blocky stairs), the exact intersection point $\mathbf{P}$ along an edge between corner $\mathbf{P}_1$ (weight $V_1$) and corner $\mathbf{P}_2$ (weight $V_2$) is linearly interpolated:
-   $$\mathbf{P} = \mathbf{P}_1 + \frac{\text{IsoLevel} - V_1}{V_2 - V_1} (\mathbf{P}_2 - \mathbf{P}_1)$$
-5. **Append Buffer Output:** Each constructed `Triangle` (3 `float3` vertices scaled to world units) is pushed atomically to `AppendStructuredBuffer<Triangle> _Triangles`.
+## Key Engineering Challenges & Optimizations Solved
 
-### 3. Level of Detail (LOD) Scaling
-Defined in `GridMetrics.cs`, the chunk stores its master density data at the highest resolution (`LastLod` = 80 points per axis, or $80^3 = 512,000$ sample points). When polygonizing at a lower `LOD` setting (`LODs = { 8, 16, 24, 32, 40, 48, 56, 64, 72, 80 }`), `Chunk.cs` computes a scale factor:
-$$\text{LodScaleFactor} = \frac{\text{PointsPerChunk}(\text{LastLod})}{\text{PointsPerChunk}(\text{LOD})}$$
-The `March` kernel steps through the underlying density grid by `unit = 1 * _LodScaleFactor`, allowing real-time mesh simplification without regenerating or losing high-resolution terrain edits.
-
-### 4. Real-Time Interactive Terraforming
-`TerraformingCamera.cs` casts a physics ray from the camera through the mouse cursor against the chunk's `MeshCollider`:
-- **Left Click (`Input.GetMouseButton(0)`):** Adds density (`+1.0`), building terrain.
-- **Right Click (`Input.GetMouseButton(1)`):** Subtracts density (`-1.0`), carving caves/tunnels.
-- When a hit is detected, `Chunk.EditWeights()` dispatches the `UpdateWeights` compute kernel (`MarchingCubesCompute.compute`), which checks every grid point's world-space distance to `_HitPosition` in parallel and modifies weights within `_BrushSize`, then immediately rebuilds the mesh and collider.
+1. **Eliminating Sync GPU Stalls During Large-World Exploration:** Replaced blocking `ComputeBuffer.GetData()` calls with a 16-slot two-stage `AsyncGPUReadback` pipeline and budgeted CPU mesh finalization (`1.5 ms/frame`).
+2. **Preventing Exponential Empty-Chunk Splits & LOD Cracks:** Added IVT empty-state tracking (`AllAir`/`AllSolid`), `ProgressiveGateDepth`, strictly LOD-invariant noise math (removing `_CellSize`-dependent octaves), and `1.50 * cellSize` watertight skirts.
+3. **Removing Close-Up Flight & Fragment Shader Bottlenecks:** Cut fragment shader noise cost from multi-octave FBM loops (~144 hashes/pixel) down to 3 single `ValueNoise3D` lookups plus ocean-gated analytical waves, capped close-up depth at `MaxDepth = 8`, defaulted to flat low-poly shading, and disabled background collider cooking (`AutoBakeNearbyColliders = false`).
+4. **Fixing Post-Sculpt Movement Lag & Dig/Fill Freezes:** Fixed an $O(N^3)$ bucket-iteration bottleneck across huge octree nodes by adding an $O(1)$ global stroke AABB gate and bucket-span cap, skipped impossible `AllAir`/`AllSolid` brush rebuilds, and replaced Physics raycasts/collider baking with direct CPU Möller–Trumbore mesh raycasting.
+5. **Fixing Water Crater Bowls & Coastline Artifacts:** Replaced the deep underwater elevation drop with a flat spherical water level (`-1.6 m` cap), removed a 15 m terrain discontinuity at `contNorm == 0`, and blended water shading completely to smooth radial planet normals (`upDir`).
 
 ---
 
@@ -81,21 +83,25 @@ The `March` kernel steps through the underlying density grid by `unit = 1 * _Lod
 
 ```text
 Assets/
+├── GroundMat.mat                              # Stylized terrain material preset
+├── SpaceSkyboxMat.mat                         # Space-to-atmosphere skybox material preset
+├── ProceduralTerrain.shader                   # URP terrain, ocean & horizon-haze shader
+├── SpaceAtmosphereSkybox.shader               # Space starfield, cyan sky, clouds & moon shader
 ├── Scenes/
-│   └── SampleScene.unity                  # Main demo scene with Chunk, NoiseGenerator, and Camera
+│   └── SampleScene.unity                      # Pre-configured 60 km planet scene
 └── Scripts/
-    ├── Chunk.cs                           # Manages ComputeBuffers, dispatches March/UpdateWeights, builds Mesh
-    ├── GridMetrics.cs                     # Constants for thread group sizes (8), world scale (32), and LOD tiers
-    ├── NoiseGenerator.cs                  # Dispatches NoiseCompute shader to generate 3D scalar weights
-    ├── TerraformingCamera.cs              # Raycast controller + Gizmo visualizer for adding/removing terrain
-    ├── SmoothShadingDemo.cs               # Reference implementation for vertex deduplication & smooth normals
+    ├── Chunk.cs                               # 16-slot async readback, skirts, CPU raycast, 8-slot LRU cache
+    ├── PlanetOctree.cs                        # 3-stage culling, progressive LOD, stroke spatial indexing
+    ├── GridMetrics.cs                         # Thread-group sizing (8³) and LOD resolution table
+    ├── NoiseGenerator.cs                      # Planetary & cavern uniforms + compute dispatch
+    ├── TerraformingCamera.cs                  # Smoothed mouse flight controller, HUD, sculpt input
     └── Compute/
-        ├── MarchingCubesCompute.compute   # Core GPU kernels: 'March' (polygonization) & 'UpdateWeights'
-        ├── NoiseCompute.compute           # GPU kernel: 'GenerateNoise' using 3D FastNoiseLite
+        ├── MarchingCubesCompute.compute       # March (triangles + IVT), UpdateWeights, UpdateWeightsBatch
+        ├── NoiseCompute.compute               # Spherical terrain, hills, mountains, overhangs & caves
         └── Includes/
-            ├── FastNoiseLite.compute      # HLSL port of FastNoiseLite procedural noise library
-            ├── MarchingTable.hlsl         # Lookup tables: edgeConnections[12][2], cornerOffsets[8], triTable[256][16]
-            └── MetricsCompute.compute     # Shared GPU constants and 3D-to-1D indexFromCoord() helper
+            ├── FastNoiseLite.compute          # 3D OpenSimplex2 / Perlin noise primitives
+            ├── MarchingTable.hlsl             # 256-case Marching Cubes edge & triangle LUTs
+            └── MetricsCompute.compute         # Shared grid dimensions & indexing helpers
 ```
 
 ---
@@ -103,21 +109,29 @@ Assets/
 ## Getting Started & Controls
 
 ### Prerequisites
-- **Unity Editor:** `6000.0.22f1` (Unity 6) or compatible Unity 2022.3+ LTS with Universal Render Pipeline (URP) and Compute Shader support (DirectX 11/12, Vulkan, or Metal).
+- **Unity Editor:** `6000.0.22f1` (Unity 6) with Universal Render Pipeline (URP) and Compute Shader support.
 
 ### Running the Project
-1. Clone or download this repository and open the root folder in **Unity Hub**.
-2. Open `Assets/Scenes/SampleScene.unity`.
-3. Press **Play** in the Unity Editor.
+1. Open the repository folder in **Unity Hub** and open `Assets/Scenes/SampleScene.unity`.
+2. Press **Play** in the Unity Editor (the scene comes pre-wired with `PlanetOctree`, `NoiseGenerator`, `Chunk`, `TerraformingCamera`, `GroundMat`, and `SpaceSkyboxMat`).
 
-### Interactive Controls & Inspector Parameters
-- **Left Mouse Button (Hold):** Sculpt / add terrain at the cursor raycast position.
-- **Right Mouse Button (Hold):** Excavate / dig caves at the cursor raycast position.
-- **`Chunk` Inspector:**
-  - `LOD` slider (`0` to `9`): Adjusts mesh resolution in real time (`8³` to `80³` grid subdivisions).
-- **`NoiseGenerator` Inspector:**
-  - `Noise Scale`, `Amplitude`, `Frequency`, `Octaves`, `Ground Percent`: Customize cave density and fractal detail.
-- **`TerraformingCamera` Inspector:**
-  - `Brush Size`: Radius of the spherical terraforming brush (visualized as a yellow wire sphere Gizmo in Scene view).
-
----
+### Controls
+| Input | Action |
+| :--- | :--- |
+| **`W / A / S / D`** | Fly forward / strafe / backward |
+| **`E` / `Space`**, **`Q` / `Ctrl`** | Ascend / descend (scales smoothly with altitude) |
+| **`Left Shift`** | Flight speed boost (`3.0x`) |
+| **`Mouse` / `Arrow Keys`** | Steer camera (with altitude-aware planet horizon auto-alignment) |
+| **`Tab` / `C` / `Middle Click`** | Lock cursor for flight steering (`Esc` to unlock; `Alt` or hold MMB for free look) |
+| **`Scroll Wheel`** | Adjust flight throttle (`0.2x`–`6.0x`; hold `Left Alt + Scroll` to resize brush) |
+| **`Left Mouse` (Hold)** | Add volumetric terrain (fill/build) |
+| **`Right Mouse` (Hold)** | Carve volumetric terrain (dig) |
+| **`[` / `]`** | Decrease / increase brush radius (`4 m`–`300 m`) |
+| **`-` / `=`** | Decrease / increase surface render distance (`2 km`–`20 km`) |
+| **`F`** | Toggle Flat Faceted vs Smooth Welded shading |
+| **`G`** | Toggle Octree chunk bounds wireframe |
+| **`K`** | Toggle Horizon & Frustum partial culling |
+| **`L`** | Freeze / resume Octree streaming |
+| **`N`** | Switch noise generator (`OpenSimplex2` / `Perlin`) |
+| **`R`** | Clear all sculpting edits and rebuild planet |
+| **`H`** | Show / hide live telemetry HUD & crosshair |

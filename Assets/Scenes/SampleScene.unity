@@ -26,7 +26,7 @@ RenderSettings:
   m_AmbientIntensity: 1
   m_AmbientMode: 0
   m_SubtractiveShadowColor: {r: 0.42, g: 0.478, b: 0.627, a: 1}
-  m_SkyboxMaterial: {fileID: 10304, guid: 0000000000000000f000000000000000, type: 0}
+  m_SkyboxMaterial: {fileID: 2100000, guid: d5a9f32b7c0144e29b34f56a78c90123, type: 2}
   m_HaloStrength: 0.5
   m_FlareStrength: 1
   m_FlareFadeSpeed: 3
@@ -155,7 +155,15 @@ MonoBehaviour:
   MeshFilter: {fileID: 508039167}
   MeshCollider: {fileID: 508039168}
   NoiseGenerator: {fileID: 628971041}
-  LOD: 4
+  LOD: 1
+  ChunkScale: 32
+  UseSmoothShading: 0
+  rawVertexCount: 0
+  weldedVertexCount: 0
+  vertexReductionPercent: 0
+  triangleCount: 0
+  lastMeshRebuildMs: 0
+  usesLruWeightCache: 0
 --- !u!4 &508039165
 Transform:
   m_ObjectHideFlags: 0
@@ -194,7 +202,7 @@ MeshRenderer:
   m_RenderingLayerMask: 1
   m_RendererPriority: 0
   m_Materials:
-  - {fileID: 2100000, guid: dcbf26da3bb700b40b294bf716942f6d, type: 2}
+  - {fileID: 2100000, guid: 87c48d9f37708524dbfb9f98cd6436b8, type: 2}
   m_StaticBatchInfo:
     firstSubMesh: 0
     subMeshCount: 0
@@ -277,10 +285,21 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   NoiseShader: {fileID: 7200000, guid: 7b48c57ec1ff3b34c919dcdd80d13227, type: 3}
   noiseScale: 1
-  amplitude: 10
-  frequency: 0.02
-  octaves: 12
+  amplitude: 520
+  frequency: 0.00028
+  octaves: 4
   groundPercent: 1
+  lacunarity: 2
+  persistence: 0.5
+  usePerlinNoise: 0
+  useSphericalPlanet: 1
+  planetCenter: {x: 0, y: 0, z: 0}
+  planetRadius: 30000
+  isoLevel: 0.5
+  enableCaves: 0
+  caveDepth: 220
+  caveFrequency: 0.0055
+  caveThreshold: 0.15
 --- !u!4 &628971042
 Transform:
   m_ObjectHideFlags: 0
@@ -475,8 +494,8 @@ Camera:
     y: 0
     width: 1
     height: 1
-  near clip plane: 0.3
-  far clip plane: 1000
+  near clip plane: 0.5
+  far clip plane: 200000
   field of view: 60
   orthographic: 0
   orthographic size: 5
@@ -503,8 +522,8 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 963194225}
   serializedVersion: 2
-  m_LocalRotation: {x: -0.0073261503, y: 0.93505734, z: -0.3538919, w: -0.019357998}
-  m_LocalPosition: {x: 18.509777, y: 36.978256, z: 47.45756}
+  m_LocalRotation: {x: 0.1623092, y: 0, z: 0, w: 0.98673995}
+  m_LocalPosition: {x: 0, y: 23500, z: -69500}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -522,7 +541,17 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 3a4339d406b39a64aa1c8c2f58871f8a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  BrushSize: 2
+  BrushSize: 24
+  SculptInterval: 0.06
+  ColliderBakeInterval: 0.08
+  Octree: {fileID: 1500000002}
+  MoveSpeed: 70
+  TurnSpeed: 90
+  MouseSensitivity: 2.2
+  LockMouseOnStart: 1
+  AutoAlignToPlanet: 1
+  MouseLookSmoothing: 18
+  SpeedMultiplier: 1
 --- !u!850595691 &1360605784
 LightingSettings:
   m_ObjectHideFlags: 0
@@ -584,6 +613,95 @@ LightingSettings:
   m_PVRFilteringAtrousPositionSigmaIndirect: 2
   m_PVRFilteringAtrousPositionSigmaAO: 1
   m_RespectSceneVisibilityWhenBakingGI: 0
+--- !u!1 &1500000000
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1500000001}
+  - component: {fileID: 1500000002}
+  m_Layer: 0
+  m_Name: PlanetOctree
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &1500000001
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1500000000}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1500000002
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1500000000}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a9f4c2b87e3148d29c6510fa4b3d8e21, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  EnableOctreeMode: 1
+  UseSphericalPlanet: 1
+  Viewer: {fileID: 963194228}
+  NoiseGenerator: {fileID: 628971041}
+  MarchingShader: {fileID: 7200000, guid: 69106abfae53e454f85c24e116a34bdd, type: 3}
+  TerrainMaterial: {fileID: 2100000, guid: 87c48d9f37708524dbfb9f98cd6436b8, type: 2}
+  ChunkPrefab: {fileID: 508039164}
+  PlanetCenter: {x: 0, y: 0, z: 0}
+  PlanetRadius: 30000
+  RootSize: 65536
+  ShellMargin: 100
+  StrokeBucketSize: 128
+  MinShellDepth: 2
+  SurfaceRenderDistance: 10000
+  MaxDetailDistance: 450
+  EnableHorizonCulling: 1
+  HorizonMarginDegrees: 4
+  UndergroundLoadRadius: 450
+  EnableFrustumCulling: 1
+  UnloadOutOfFrustumChunks: 1
+  ImmediateBubbleRadius: 320
+  FrustumUnloadDistance: 900
+  ColliderActiveDistance: 260
+  AutoBakeNearbyColliders: 0
+  ProgressiveGateDepth: 6
+  MaxDepth: 8
+  SplitDistanceMultiplier: 1.2
+  BaseLOD: 1
+  MaxLeafLOD: 1
+  UseAsyncGpuStreaming: 1
+  UpdateMoveThreshold: 36
+  RefreshMinInterval: 0.14
+  FrameBuildBudgetMs: 1.5
+  MaxAsyncDispatchesPerFrame: 3
+  VelocityLookAheadSeconds: 0.25
+  smoothShadingEnabled: 0
+  activeChunkCount: 0
+  pooledChunkCount: 0
+  culledNodeCount: 0
+  culledShellCount: 0
+  culledHorizonCount: 0
+  culledFrustumCount: 0
+  emptyLeafCount: 0
+  recordedStrokeCount: 0
+  pendingBuildCount: 0
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
@@ -592,3 +710,4 @@ SceneRoots:
   - {fileID: 705507995}
   - {fileID: 628971042}
   - {fileID: 508039165}
+  - {fileID: 1500000001}
